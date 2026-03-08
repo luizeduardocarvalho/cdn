@@ -4,36 +4,50 @@ A Content Delivery Network built from scratch in Go as a learning project. Singl
 
 ## Architecture
 
-```
-          ┌─────────────────────┐
-          │       Client        │
-          └──────────┬──────────┘
-                     │
-                     ▼
-          ┌─────────────────────┐
-          │       Router        │  :8081
-          │  (geo routing +     │
-          │   health checks +   │
-          │   round-robin)      │
-          └──────────┬──────────┘
-                     │
-            ┌────────┴────────┐
-            ▼                 ▼
-   ┌─────────────────┐ ┌─────────────────┐
-   │    Edge Node     │ │    Edge Node     │
-   │    "europe"      │ │    "america"     │
-   │    :3001         │ │    :3002         │
-   │  (reverse proxy  │ │  (reverse proxy  │
-   │   + in-memory    │ │   + in-memory    │
-   │   cache)         │ │   cache)         │
-   └────────┬─────────┘ └────────┬─────────┘
-            │    cache miss only  │
-            └────────┬────────────┘
-                     ▼
-          ┌─────────────────────┐
-          │       Origin        │  :8080
-          │  (source of truth)  │
-          └─────────────────────┘
+```mermaid
+graph TB
+    Client([Client])
+
+    Client -->|request| Router
+
+    subgraph Router["Router :8081"]
+        direction TB
+        R1[Geo Routing<br/>X-Region header]
+        R2[Round-Robin<br/>fallback]
+        R3[Health Checks<br/>every 3s]
+        R1 --- R2
+        R1 --- R3
+    end
+
+    Router -->|europe| Edge1
+    Router -->|america| Edge2
+
+    subgraph Edge1["Edge Node — Europe :3001"]
+        direction TB
+        C1{Cache<br/>Lookup}
+        C1 -->|HIT| Resp1[Serve from<br/>memory]
+        C1 -->|MISS| Proxy1[Reverse proxy<br/>to origin]
+    end
+
+    subgraph Edge2["Edge Node — America :3002"]
+        direction TB
+        C2{Cache<br/>Lookup}
+        C2 -->|HIT| Resp2[Serve from<br/>memory]
+        C2 -->|MISS| Proxy2[Reverse proxy<br/>to origin]
+    end
+
+    Proxy1 -->|fetch| Origin
+    Proxy2 -->|fetch| Origin
+
+    subgraph Origin["Origin :8080"]
+        O1[Source of Truth]
+    end
+
+    style Router fill:#3b82f6,color:#fff,stroke:#2563eb
+    style Edge1 fill:#8b5cf6,color:#fff,stroke:#7c3aed
+    style Edge2 fill:#8b5cf6,color:#fff,stroke:#7c3aed
+    style Origin fill:#10b981,color:#fff,stroke:#059669
+    style Client fill:#f59e0b,color:#fff,stroke:#d97706
 ```
 
 ## How It Works
@@ -43,6 +57,75 @@ A Content Delivery Network built from scratch in Go as a learning project. Singl
 - **`origin`** — serves content. The single source of truth.
 - **`node`** — caching reverse proxy. Checks its local in-memory cache first; on a miss, forwards the request to the origin, caches the response, and serves it. Subsequent requests for the same path are served directly from cache until the TTL expires.
 - **`router`** — entry point for all client traffic. Routes requests to edge nodes based on the `X-Region` header for geographic targeting, with round-robin fallback. Runs background health checks and automatically removes unhealthy nodes from rotation.
+
+## Request Flow
+
+### Cache Miss
+
+The first time content is requested, the edge doesn't have it cached. It proxies to the origin, stores the response, and serves it.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant R as Router
+    participant E as Edge Node
+    participant O as Origin
+
+    C->>R: GET /index.html
+    R->>R: PickEdge (X-Region or round-robin)
+    R->>E: Forward request
+    E->>E: Cache lookup
+    Note over E: MISS — not in cache
+    E->>O: Proxy request to origin
+    O-->>E: 200 OK + body
+    E->>E: Store in cache (body + headers + TTL)
+    E-->>R: 200 OK + X-Cache-Status: MISS
+    R-->>C: 200 OK
+```
+
+### Cache Hit
+
+Subsequent requests for the same path are served directly from the edge's memory. The origin is never contacted.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant R as Router
+    participant E as Edge Node
+
+    C->>R: GET /index.html
+    R->>R: PickEdge (X-Region or round-robin)
+    R->>E: Forward request
+    E->>E: Cache lookup
+    Note over E: HIT — found and fresh
+    E-->>R: 200 OK + X-Cache-Status: HIT
+    R-->>C: 200 OK
+    Note over E: Origin never contacted
+```
+
+### Health Checks
+
+The router pings each edge every 3 seconds. Unhealthy nodes are removed from rotation automatically.
+
+```mermaid
+sequenceDiagram
+    participant R as Router
+    participant E1 as Edge 1 (europe)
+    participant E2 as Edge 2 (america)
+
+    loop Every 3 seconds
+        R->>E1: GET /health
+        E1-->>R: 200 OK
+        Note over R: Edge 1 ✓ healthy
+
+        R->>E2: GET /health
+        E2-->>R: timeout / error
+        Note over R: Edge 2 ✗ DOWN
+    end
+
+    Note over R: Remove Edge 2 from rotation
+    Note over R: All traffic → Edge 1
+```
 
 ## Quick Start
 
@@ -89,8 +172,6 @@ curl http://localhost:8081/
 ```
 
 ### Health checks
-
-The router pings each edge's `/health` endpoint every 3 seconds. Unhealthy nodes are skipped.
 
 ```bash
 # Stop an edge — router will detect it and route around
