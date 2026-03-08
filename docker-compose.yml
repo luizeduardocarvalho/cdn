@@ -1,0 +1,30 @@
+services:
+  origin:
+    build: .
+    command: ["--type=origin"]
+    ports:
+      - "8080:8080"
+
+  node1:
+    build: .
+    command: ["--type=node", "--location=europe", "--port=3001"]
+    environment:
+      - ORIGIN_URL=http://origin:8080
+    ports:
+      - "3001:3001"
+
+  node2:
+    build: .
+    command: ["--type=node", "--location=america", "--port=3002"]
+    environment:
+      - ORIGIN_URL=http://origin:8080
+    ports:
+      - "3002:3002"
+
+  router:
+    build: .
+    command: ["--type=router"]
+    environment:
+      - EDGE_MAP=europe=http://node1:3001,america=http://node2:3002
+    ports:
+      - "8081:8081"
